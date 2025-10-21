@@ -1,7 +1,10 @@
 """MapReduce framework Worker node."""
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import heapq
+import itertools
 import json
 import logging
 import os
@@ -10,8 +13,9 @@ import subprocess
 import tempfile
 import threading
 from pathlib import Path
-from typing import Iterable, List, Optional
+from typing import Iterable, List, Optional, TextIO
 
+import shutil
 import click
 
 from mapreduce.utils import serve_tcp
@@ -144,16 +148,17 @@ class Worker:
         prefix = f"mapreduce-local-task{task_id:05d}-"
         with tempfile.TemporaryDirectory(prefix=prefix) as tmpdir:
             tmp_path = Path(tmpdir)
-            raw_outputs = self._run_mapper_commands(
-                executable, input_paths, tmp_path
+            partition_paths = self._execute_mapper(
+                executable=executable,
+                input_paths=input_paths,
+                temp_dir=tmp_path,
+                task_id=task_id,
+                num_partitions=num_partitions,
             )
-            sorted_output = tmp_path / "sorted-mapper-output"
-            self._sort_files(raw_outputs, sorted_output)
-            self._write_map_partitions(
-                sorted_output,
-                output_directory,
-                task_id,
-                num_partitions,
+            output_directory.mkdir(parents=True, exist_ok=True)
+            self._finalize_map_partitions(
+                partition_paths=partition_paths,
+                destination=output_directory,
             )
 
         self._notify_task_finished(task_id)
@@ -171,14 +176,14 @@ class Worker:
         prefix = f"mapreduce-local-task{task_id:05d}-"
         with tempfile.TemporaryDirectory(prefix=prefix) as tmpdir:
             tmp_path = Path(tmpdir)
-            sorted_input = tmp_path / "sorted-reducer-input"
-            input_strings = [str(path) for path in input_paths]
-            self._sort_files(input_strings, sorted_input)
-            self._run_reducer_command(
-                executable,
-                sorted_input,
-                output_directory / f"part-{task_id:05d}",
+            temp_output = tmp_path / f"part-{task_id:05d}"
+            self._run_reducer(
+                executable=executable,
+                input_paths=input_paths,
+                destination=temp_output,
             )
+            output_directory.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(temp_output), output_directory / temp_output.name)
 
         self._notify_task_finished(task_id)
 
@@ -186,125 +191,187 @@ class Worker:
     # Task helpers
     # ------------------------------------------------------------------ #
 
-    def _run_mapper_commands(
+    def _execute_mapper(
         self,
         executable: str,
         input_paths: Iterable[Path],
         temp_dir: Path,
-    ) -> List[str]:
-        """Run mapper executable for each input path and capture outputs."""
-        raw_outputs: List[str] = []
-        for index, input_path in enumerate(input_paths):
-            raw_path = temp_dir / f"mapper-{index:05d}.out"
-            raw_outputs.append(str(raw_path))
-            if not input_path.exists():
-                raw_path.touch()
-                continue
-            with open(input_path, "rb") as infile, open(
-                raw_path,
-                "wb",
-            ) as outfile:
-                with subprocess.Popen(
-                    [executable],
-                    stdin=infile,
-                    stdout=outfile,
-                    stderr=subprocess.PIPE,
-                ) as process:
-                    _, stderr = process.communicate()
-                    if process.returncode != 0:
-                        error_msg = stderr.decode()
-                        message = (
-                            "Mapper exited with "
-                            f"{process.returncode}: {error_msg}"
-                        )
-                        raise RuntimeError(message)
-        if not raw_outputs:
-            empty_file = temp_dir / "mapper-empty.out"
-            empty_file.touch()
-            raw_outputs.append(str(empty_file))
-        return raw_outputs
-
-    def _sort_files(self, inputs: Iterable[str], destination: Path) -> None:
-        """Sort concatenated files using external sort."""
-        with open(destination, "wb") as outfile:
-            with subprocess.Popen(
-                ["sort", *inputs],
-                stdout=outfile,
-                stderr=subprocess.PIPE,
-                env=self._sort_env(),
-            ) as process:
-                _, stderr = process.communicate()
-                if process.returncode != 0:
-                    error_msg = stderr.decode()
-                    raise RuntimeError(
-                        f"sort exited with {process.returncode}: {error_msg}"
-                    )
-
-    def _write_map_partitions(
-        self,
-        sorted_output: Path,
-        output_directory: Path,
         task_id: int,
         num_partitions: int,
-    ) -> None:
-        """Partition sorted mapper output into num_partitions files."""
-        if num_partitions <= 0:
-            raise ValueError("num_partitions must be > 0")
+    ) -> List[Path]:
+        partition_paths: List[Path] = []
+        with contextlib.ExitStack() as stack:
+            partition_data: List[tuple[Path, TextIO]] = []
+            for partition in range(num_partitions):
+                path = temp_dir / (
+                    f"maptask{task_id:05d}-part{partition:05d}.unsorted"
+                )
+                handle = stack.enter_context(
+                    path.open("w", encoding="utf-8", newline="")
+                )
+                partition_data.append((path, handle))
+                partition_paths.append(path)
+            for input_path in input_paths:
+                self._stream_mapper_output(
+                    executable=executable,
+                    input_path=input_path,
+                    partition_data=partition_data,
+                    num_partitions=num_partitions,
+                )
 
-        output_directory.mkdir(parents=True, exist_ok=True)
-        partition_paths = [
-            output_directory / (
-                f"maptask{task_id:05d}-part{partition:05d}"
-            )
-            for partition in range(num_partitions)
-        ]
-        partition_files = [
-            path.open("w", encoding="utf-8", newline="")
-            for path in partition_paths
-        ]
-        try:
-            with sorted_output.open("r", encoding="utf-8") as infile:
-                for line in infile:
+        return partition_paths
+
+    def _stream_mapper_output(
+        self,
+        executable: str,
+        input_path: Path,
+        partition_data: List[tuple[Path, TextIO]],
+        num_partitions: int,
+    ) -> None:
+        if not input_path.exists():
+            return
+        with open(input_path, "r", encoding="utf-8") as infile:
+            with subprocess.Popen(
+                [executable],
+                stdin=infile,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            ) as process:
+                if process.stdout is None:
+                    raise RuntimeError("Mapper stdout unavailable")
+                for line in process.stdout:
                     key = line.split("\t", 1)[0]
                     partition_index = self._partition_for_key(
                         key,
                         num_partitions,
                     )
-                    partition_files[partition_index].write(line)
-        finally:
-            for handle in partition_files:
-                handle.close()
-
-        # Ensure partition files exist even if no data was written.
-        for path in partition_paths:
-            path.touch(exist_ok=True)
-
-    def _run_reducer_command(
-        self,
-        executable: str,
-        sorted_input: Path,
-        destination: Path,
-    ) -> None:
-        """Run reducer executable against sorted input."""
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        with open(sorted_input, "rb") as infile, open(
-            destination,
-            "wb",
-        ) as outfile:
-            with subprocess.Popen(
-                [executable],
-                stdin=infile,
-                stdout=outfile,
-                stderr=subprocess.PIPE,
-            ) as process:
-                _, stderr = process.communicate()
-                if process.returncode != 0:
-                    error_msg = stderr.decode()
+                    partition_data[partition_index][1].write(line)
+                stderr_output = ""
+                if process.stderr:
+                    stderr_output = process.stderr.read()
+                return_code = process.wait()
+                if return_code != 0:
                     message = (
-                        "Reducer exited with "
-                        f"{process.returncode}: {error_msg}"
+                        "Mapper exited with "
+                        f"{return_code}: {stderr_output}"
                     )
                     raise RuntimeError(message)
+
+    CHUNK_SIZE_LINES = 2000
+
+    def _finalize_map_partitions(
+        self,
+        partition_paths: List[Path],
+        destination: Path,
+    ) -> None:
+        for unsorted_path in partition_paths:
+            sorted_path = self._sorted_partition_path(unsorted_path)
+            final_name = unsorted_path.name.replace(".unsorted", "")
+            final_path = destination / final_name
+            shutil.move(str(sorted_path), final_path)
+            final_path.touch(exist_ok=True)
+
+    def _sorted_partition_path(self, path: Path) -> Path:
+        if self._try_external_sort(path):
+            return path
+        self._fallback_chunked_sort(path)
+        return path
+
+    def _try_external_sort(self, path: Path) -> bool:
+        try:
+            subprocess.run(
+                ["sort", "-o", str(path), str(path)],
+                check=True,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            return True
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            return False
+
+    def _fallback_chunked_sort(self, path: Path) -> None:
+        chunk_paths: List[Path] = []
+        try:
+            with path.open("r", encoding="utf-8") as infile:
+                while True:
+                    chunk = list(
+                        itertools.islice(
+                            infile,
+                            self.CHUNK_SIZE_LINES,
+                        )
+                    )
+                    if not chunk:
+                        break
+                    chunk.sort()
+                    temp_file = tempfile.NamedTemporaryFile(
+                        mode="w",
+                        encoding="utf-8",
+                        delete=False,
+                        prefix="mapreduce-chunk-",
+                        dir=path.parent,
+                    )
+                    temp_path = Path(temp_file.name)
+                    with temp_file:
+                        temp_file.writelines(chunk)
+                    chunk_paths.append(temp_path)
+
+            if not chunk_paths:
+                path.write_text("", encoding="utf-8")
+                return
+
+            with contextlib.ExitStack() as stack:
+                streams = [
+                    stack.enter_context(
+                        chunk_path.open("r", encoding="utf-8")
+                    )
+                    for chunk_path in chunk_paths
+                ]
+                with path.open("w", encoding="utf-8") as outfile:
+                    for line in heapq.merge(*streams):
+                        outfile.write(line)
+        finally:
+            for chunk_path in chunk_paths:
+                try:
+                    chunk_path.unlink()
+                except FileNotFoundError:
+                    continue
+
+    def _run_reducer(
+        self,
+        executable: str,
+        input_paths: Iterable[Path],
+        destination: Path,
+    ) -> None:
+        with contextlib.ExitStack() as stack:
+            streams = [
+                stack.enter_context(path.open("r", encoding="utf-8"))
+                for path in input_paths
+            ]
+            merged_stream = heapq.merge(*streams)
+            with destination.open("w", encoding="utf-8") as outfile:
+                with subprocess.Popen(
+                    [executable],
+                    stdin=subprocess.PIPE,
+                    stdout=outfile,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                ) as process:
+                    if process.stdin is None:
+                        raise RuntimeError("Reducer stdin unavailable")
+                    for line in merged_stream:
+                        process.stdin.write(line)
+                    process.stdin.close()
+                    stderr_output = ""
+                    if process.stderr:
+                        stderr_output = process.stderr.read()
+                    return_code = process.wait()
+                    if return_code != 0:
+                        message = (
+                            "Reducer exited with "
+                            f"{return_code}: {stderr_output}"
+                        )
+                        raise RuntimeError(message)
 
     def _notify_task_finished(self, task_id: int) -> None:
         self._send_manager_message({
@@ -318,12 +385,6 @@ class Worker:
     def _partition_for_key(key: str, num_partitions: int) -> int:
         digest = hashlib.md5(key.encode("utf-8")).hexdigest()
         return int(digest, 16) % num_partitions
-
-    @staticmethod
-    def _sort_env() -> dict:
-        env = dict(os.environ)
-        env.setdefault("LC_ALL", "C")
-        return env
 
     # ------------------------------------------------------------------ #
     # Heartbeat handling
