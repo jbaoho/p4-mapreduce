@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+
+readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+cd "${REPO_ROOT}"
+
+readonly MANAGER_PATTERN="mapreduce-manager"
+readonly WORKER_PATTERN="mapreduce-worker"
+
+usage() {
+    echo "Usage: $0 {start|stop|status|restart}" >&2
+    exit 1
+}
+
+manager_running() {
+    pgrep -f "${MANAGER_PATTERN}" >/dev/null 2>&1
+}
+
+worker_running() {
+    pgrep -f "${WORKER_PATTERN}" >/dev/null 2>&1
+}
+
+start_services() {
+    if manager_running; then
+        echo "Error: mapreduce-manager is already running" >&2
+        exit 1
+    fi
+    if worker_running; then
+        echo "Error: mapreduce-worker is already running" >&2
+        exit 1
+    fi
+
+    echo "starting mapreduce ..."
+    mkdir -p var/log
+    rm -f var/log/manager.log var/log/worker-6001.log var/log/worker-6002.log
+
+    mapreduce-manager --host localhost --port 6000 --logfile var/log/manager.log &
+    sleep 2
+    mapreduce-worker --host localhost --port 6001 --manager-host localhost --manager-port 6000 --logfile var/log/worker-6001.log &
+    mapreduce-worker --host localhost --port 6002 --manager-host localhost --manager-port 6000 --logfile var/log/worker-6002.log &
+}
+
+stop_services() {
+    echo "stopping mapreduce ..."
+    mapreduce-submit --shutdown --host localhost --port 6000 >/dev/null 2>&1 || true
+    sleep 2
+
+    if manager_running; then
+        echo "killing mapreduce manager ..."
+        pkill -f "${MANAGER_PATTERN}" || true
+    fi
+    if worker_running; then
+        echo "killing mapreduce worker ..."
+        pkill -f "${WORKER_PATTERN}" || true
+    fi
+}
+
+status_services() {
+    local manager_status=1
+    local worker_status=1
+
+    if manager_running; then
+        echo "manager running"
+        manager_status=0
+    else
+        echo "manager not running"
+    fi
+
+    if worker_running; then
+        echo "workers running"
+        worker_status=0
+    else
+        echo "workers not running"
+    fi
+
+    if [[ "${manager_status}" -eq 0 && "${worker_status}" -eq 0 ]]; then
+        exit 0
+    else
+        exit 1
+    fi
+}
+
+restart_services() {
+    stop_services
+    start_services
+}
+
+main() {
+    if [[ $# -ne 1 ]]; then
+        usage
+    fi
+
+    case "$1" in
+        start)
+            start_services
+            ;;
+        stop)
+            stop_services
+            ;;
+        status)
+            status_services
+            ;;
+        restart)
+            restart_services
+            ;;
+        *)
+            usage
+            ;;
+    esac
+}
+
+main "$@"

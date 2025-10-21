@@ -1,1 +1,9 @@
 .venv/
+mapreduce/__pycache__/
+mapreduce/manager/__pycache__/
+mapreduce/utils/__pycache__/
+mapreduce/worker/__pycache__/
+submit.tar.gz
+tests/__pycache__/
+tests/utils/__pycache__/
+var/
